@@ -94,3 +94,6 @@ compile_error!(
 
 #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
 include!("lib_inner.rs");
+
+/// 显式准入、真实 backing 所有权与可取消运行服务。
+pub mod scoped;

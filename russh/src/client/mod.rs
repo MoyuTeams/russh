@@ -75,10 +75,22 @@ use crate::{
 
 mod encrypted;
 mod kex;
+mod runtime;
+mod scoped;
 mod session;
+
+pub use scoped::{
+    ScopedAuthInfo, ScopedAuthResult, ScopedChannel, ScopedChannelMsg, ScopedChannelOpen,
+    ScopedChannelType, ScopedDisconnectReason, ScopedHandle, ScopedHandler,
+    ScopedKeyboardInteractiveResponse, ScopedOpenInfo, ScopedPrompt, ScopedPrompts,
+    ScopedSignRequest, ScopedSigner, connect_stream_scoped,
+};
 
 #[cfg(test)]
 mod test;
+
+#[cfg(test)]
+mod scoped_runtime_tests;
 
 /// Actual client session's state.
 ///
@@ -89,16 +101,23 @@ mod test;
 pub struct Session {
     kex: SessionKexState<ClientKex>,
     common: CommonSession<Arc<Config>>,
-    receiver: Receiver<Msg>,
-    sender: UnboundedSender<Reply>,
+    receiver: LegacyReceiver,
+    sender: ReplySender,
     channels: HashMap<ChannelId, ChannelRef>,
     target_window_size: u32,
     pending_reads: Vec<Vec<u8>>,
     pending_len: u32,
-    inbound_channel_sender: Sender<Msg>,
-    inbound_channel_receiver: Receiver<Msg>,
+    inbound_channel_sender: Option<Sender<Msg>>,
+    inbound_channel_receiver: LegacyReceiver,
     open_global_requests: VecDeque<GlobalRequestResponse>,
     server_sig_algs: Option<Vec<Algorithm>>,
+    scoped_receiver: Option<crate::scoped::queue::Receiver<scoped::Command>>,
+    scoped_auth: Option<scoped::auth::State>,
+    scoped_channels: Option<crate::scoped::ErasedRooted<scoped::channel::State>>,
+    scoped_write: Option<scoped::WritePacket>,
+    scoped_last_channel: u32,
+    scoped_control: Option<scoped::control::State>,
+    scoped_legacy_offset: usize,
 }
 
 impl Drop for Session {
@@ -130,6 +149,65 @@ enum Reply {
         instructions: String,
         prompts: Vec<Prompt>,
     },
+}
+
+#[derive(Debug)]
+enum ReplySender {
+    Legacy(UnboundedSender<Reply>),
+    Scoped,
+}
+
+#[derive(Debug, Default)]
+struct LegacyReceiver(Option<Receiver<Msg>>);
+
+impl From<Receiver<Msg>> for LegacyReceiver {
+    fn from(receiver: Receiver<Msg>) -> Self {
+        Self(Some(receiver))
+    }
+}
+
+impl LegacyReceiver {
+    async fn recv(&mut self) -> Option<Msg> {
+        match &mut self.0 {
+            Some(receiver) => receiver.recv().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, Receiver::len)
+    }
+
+    fn close(&mut self) {
+        if let Some(receiver) = &mut self.0 {
+            receiver.close();
+        }
+    }
+
+    fn try_recv(&mut self) -> Result<Msg, tokio::sync::mpsc::error::TryRecvError> {
+        match &mut self.0 {
+            Some(receiver) => receiver.try_recv(),
+            None => Err(tokio::sync::mpsc::error::TryRecvError::Disconnected),
+        }
+    }
+}
+
+impl From<UnboundedSender<Reply>> for ReplySender {
+    fn from(sender: UnboundedSender<Reply>) -> Self {
+        Self::Legacy(sender)
+    }
+}
+
+impl ReplySender {
+    async fn send(&self, reply: Reply) -> Result<(), tokio::sync::mpsc::error::SendError<()>> {
+        let result = match self {
+            Self::Legacy(sender) => sender.send(reply),
+            // Channel 自己的接收队列已经传递该结果，scoped 认证队列不保存副本。
+            Self::Scoped if matches!(reply, Reply::ChannelOpenFailure) => Ok(()),
+            Self::Scoped => Err(tokio::sync::mpsc::error::SendError(reply)),
+        };
+        result.map_err(|_| tokio::sync::mpsc::error::SendError(()))
+    }
 }
 
 #[derive(Debug)]
@@ -631,7 +709,10 @@ impl<H: Handler> Handle<H> {
             })
             .await
             .map_err(|_| crate::Error::SendError)?;
-        let _ = tokio::time::timeout(Duration::from_secs(1), receiver).await;
+        match runtime::timeout(&runtime::Legacy, Duration::from_secs(1), receiver).await {
+            Ok(_) => (),
+            Err(never) => match never {},
+        }
         Ok(())
     }
 
@@ -1097,14 +1178,20 @@ impl Session {
     fn new(
         target_window_size: u32,
         common: CommonSession<Arc<Config>>,
-        receiver: Receiver<Msg>,
-        sender: UnboundedSender<Reply>,
+        receiver: impl Into<LegacyReceiver>,
+        sender: impl Into<ReplySender>,
     ) -> Self {
-        let (inbound_channel_sender, inbound_channel_receiver) = channel(10);
+        let receiver = receiver.into();
+        let (inbound_channel_sender, inbound_channel_receiver) = if receiver.0.is_some() {
+            let (sender, receiver) = channel(10);
+            (Some(sender), LegacyReceiver::from(receiver))
+        } else {
+            (None, LegacyReceiver::default())
+        };
         Self {
             common,
             receiver,
-            sender,
+            sender: sender.into(),
             kex: SessionKexState::Idle,
             target_window_size,
             inbound_channel_sender,
@@ -1114,6 +1201,13 @@ impl Session {
             pending_len: 0,
             open_global_requests: VecDeque::new(),
             server_sig_algs: None,
+            scoped_receiver: None,
+            scoped_auth: None,
+            scoped_channels: None,
+            scoped_write: None,
+            scoped_last_channel: 0,
+            scoped_control: None,
+            scoped_legacy_offset: 0,
         }
     }
 
@@ -1169,10 +1263,75 @@ impl Session {
         handler: &mut H,
         kex_done_signal: &mut Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<RemoteDisconnectInfo, H::Error> {
-        let mut result: Result<RemoteDisconnectInfo, H::Error> = Err(Error::Disconnect.into());
+        match self
+            .run_inner_with(
+                stream_read,
+                stream_write,
+                handler,
+                kex_done_signal,
+                &runtime::Legacy,
+            )
+            .await
+        {
+            Ok(info) => Ok(info),
+            Err(runtime::RunError::Operation(error)) => Err(error),
+            Err(runtime::RunError::Disconnected) => Err(Error::Disconnect.into()),
+            Err(runtime::RunError::Runtime(never)) => match never {},
+        }
+    }
+
+    async fn run_inner_with<H, R, T>(
+        &mut self,
+        stream_read: SshRead<ReadHalf<R>>,
+        stream_write: &mut WriteHalf<R>,
+        handler: &mut H,
+        kex_done_signal: &mut Option<oneshot::Sender<()>>,
+        runtime: &T,
+    ) -> Result<RemoteDisconnectInfo, runtime::RunError<H::Error, T::Fault>>
+    where
+        H: Handler + Send,
+        R: AsyncRead + AsyncWrite + Unpin + Send,
+        T: runtime::PacketHandler<H>,
+    {
+        let run = self.run_loop(stream_read, stream_write, handler, kex_done_signal, runtime);
+        pin!(run);
+        futures::future::poll_fn(|cx| {
+            runtime.begin_poll();
+            runtime.register_poll(cx);
+            if let Err(fault) = runtime.check() {
+                return Poll::Ready(Err(runtime::RunError::Runtime(fault)));
+            }
+            let result = run.as_mut().poll(cx);
+            if result.is_pending() && runtime.is_closing() {
+                Poll::Ready(Err(runtime::RunError::Disconnected))
+            } else {
+                result
+            }
+        })
+        .await
+    }
+
+    async fn run_loop<H, R, T>(
+        &mut self,
+        stream_read: SshRead<ReadHalf<R>>,
+        stream_write: &mut WriteHalf<R>,
+        handler: &mut H,
+        kex_done_signal: &mut Option<oneshot::Sender<()>>,
+        runtime: &T,
+    ) -> Result<RemoteDisconnectInfo, runtime::RunError<H::Error, T::Fault>>
+    where
+        H: Handler + Send,
+        R: AsyncRead + AsyncWrite + Unpin + Send,
+        T: runtime::PacketHandler<H>,
+    {
+        use runtime::{Event, RunError};
+
+        let mut result = Err(RunError::Disconnected);
         self.flush()?;
 
-        map_err!(self.common.packet_writer.flush_into(stream_write).await)?;
+        if !runtime.scoped_io() {
+            map_err!(self.common.packet_writer.flush_into(stream_write).await)?;
+        }
 
         let buffer = SSHBuffer::new();
 
@@ -1180,107 +1339,225 @@ impl Session {
         let mut opening_cipher = Box::new(clear::Key) as Box<dyn OpeningKey + Send>;
         std::mem::swap(&mut opening_cipher, &mut self.common.remote_to_local);
 
-        let keepalive_timer =
-            crate::future_or_pending(self.common.config.keepalive_interval, tokio::time::sleep);
+        let keepalive_timer = runtime::Timer::new(runtime, self.common.config.keepalive_interval)
+            .map_err(RunError::Runtime)?;
         pin!(keepalive_timer);
 
-        let inactivity_timer =
-            crate::future_or_pending(self.common.config.inactivity_timeout, tokio::time::sleep);
+        let inactivity_timer = runtime::Timer::new(runtime, self.common.config.inactivity_timeout)
+            .map_err(RunError::Runtime)?;
         pin!(inactivity_timer);
 
-        let reading = start_reading(stream_read, buffer, opening_cipher);
+        let reading = runtime.read(stream_read, buffer, opening_cipher);
         pin!(reading);
+        let mut next_branch = 0;
 
-        #[allow(clippy::panic)] // false positive in select! macro
         while !self.common.disconnected {
+            runtime.check().map_err(RunError::Runtime)?;
+            futures::future::poll_fn(|cx| runtime.poll_budget(cx, 1)).await;
             self.common.received_data = false;
             let mut sent_keepalive = false;
             // Keep reading the network for window adjustments, but leave
             // application output in its bounded receivers while a channel is
             // window-blocked.
-            let can_receive_outbound =
-                !self.kex.active() && !self.common.has_any_pending_data();
-            tokio::select! {
-                r = &mut reading => {
+            let can_receive_outbound = !self.kex.active() && !self.common.has_any_pending_data();
+            let event = {
+                let outbound = self.receiver.recv();
+                let inbound = self.inbound_channel_receiver.recv();
+                let scoped = async {
+                    match self.scoped_receiver.as_mut() {
+                        Some(receiver) => receiver.recv().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                pin!(outbound, inbound, scoped);
+                futures::future::poll_fn(|cx| {
+                    if runtime.is_closing() {
+                        return Poll::Ready(Event::Control);
+                    }
+                    // 显式轮转不使用 select 宏的 ambient 随机状态。
+                    for offset in 0..8 {
+                        let branch = (next_branch + offset) % 8;
+                        let event = match branch {
+                            0 => reading.as_mut().poll(cx).map(Event::Read),
+                            1 => keepalive_timer.as_mut().poll(cx).map(Event::Keepalive),
+                            2 => inactivity_timer.as_mut().poll(cx).map(Event::Inactivity),
+                            3 if can_receive_outbound => {
+                                outbound.as_mut().poll(cx).map(Event::Outbound)
+                            }
+                            4 if can_receive_outbound => {
+                                inbound.as_mut().poll(cx).map(Event::Inbound)
+                            }
+                            5 if can_receive_outbound => {
+                                scoped.as_mut().poll(cx).map(Event::Scoped)
+                            }
+                            6 => runtime.poll_control(cx).map(|()| Event::Control),
+                            7 if self.scoped_write.is_some() => {
+                                scoped::poll_write(&mut self.scoped_write, stream_write, cx)
+                                    .map(Event::Write)
+                            }
+                            7 if runtime.scoped_io() => self
+                                .common
+                                .packet_writer
+                                .poll_flush_into(stream_write, &mut self.scoped_legacy_offset, cx)
+                                .map(Event::Write),
+                            _ => Poll::Pending,
+                        };
+                        if event.is_ready() {
+                            next_branch = (branch + 1) % 8;
+                            return event;
+                        }
+                    }
+                    Poll::Pending
+                })
+                .await
+            };
+            match event {
+                Event::Read(r) => {
                     let (stream_read, mut buffer, mut opening_cipher) = match r {
-                        Ok((_, stream_read, buffer, opening_cipher)) => (stream_read, buffer, opening_cipher),
-                        Err(e) => return Err(e.into())
+                        Ok((_, stream_read, buffer, opening_cipher)) => {
+                            (stream_read, buffer, opening_cipher)
+                        }
+                        Err(e) => return Err(e.map_operation(Into::into)),
                     };
 
                     std::mem::swap(&mut opening_cipher, &mut self.common.remote_to_local);
 
-                    if buffer.buffer.len() < 5 {
-                        break
+                    if buffer.packet_bytes().len() < 5 {
+                        break;
                     }
 
-                    let mut pkt = self.maybe_decompress(&buffer)?;
-                    if !pkt.buffer.is_empty() {
-                        #[allow(clippy::indexing_slicing)] // length checked
-                        if pkt.buffer[0] == crate::msg::DISCONNECT {
-                            debug!("received disconnect");
-                            result = self.process_disconnect(&pkt).map_err(H::Error::from);
-                        } else {
-                            self.common.received_data = true;
-                            reply(self, handler, kex_done_signal, &mut pkt).await?;
-                            buffer.seqn = pkt.seqn; // TODO reply changes seqn internall, find cleaner way
+                    let payload = buffer
+                        .packet_bytes()
+                        .get(5..)
+                        .ok_or(Error::IndexOutOfBounds)?;
+                    let handled = runtime.process(self, handler, payload).await?;
+                    if !handled {
+                        let mut owner = runtime
+                            .packet(self, &buffer)
+                            .map_err(|error| error.map_operation(Into::into))?;
+                        let pkt = owner.get_mut();
+                        if !pkt.buffer.is_empty() {
+                            if pkt.buffer.first() == Some(&crate::msg::DISCONNECT) {
+                                debug!("received disconnect");
+                                result = self.process_disconnect(pkt).map_err(Into::into);
+                            } else {
+                                self.common.received_data = true;
+                                reply(self, handler, kex_done_signal, pkt)
+                                    .await
+                                    .map_err(RunError::Operation)?;
+                                buffer.seqn = pkt.seqn;
+                            }
                         }
+                    } else {
+                        self.common.received_data = true;
                     }
 
                     std::mem::swap(&mut opening_cipher, &mut self.common.remote_to_local);
-                    reading.set(start_reading(stream_read, buffer, opening_cipher));
+                    reading.set(runtime.read(stream_read, buffer, opening_cipher));
                 }
-                () = &mut keepalive_timer => {
+                Event::Keepalive(tick) => {
+                    tick.map_err(RunError::Runtime)?;
                     if let Some(ref mut enc) = self.common.encrypted {
                         if matches!(enc.state, EncryptedState::Authenticated) {
-                            self.common.alive_timeouts = self.common.alive_timeouts.saturating_add(1);
-                            if self.common.config.keepalive_max != 0 && self.common.alive_timeouts > self.common.config.keepalive_max {
+                            self.common.alive_timeouts =
+                                self.common.alive_timeouts.saturating_add(1);
+                            if self.common.config.keepalive_max != 0
+                                && self.common.alive_timeouts > self.common.config.keepalive_max
+                            {
                                 debug!("Timeout, server not responding to keepalives");
                                 return Err(crate::Error::KeepaliveTimeout.into());
                             }
                             sent_keepalive = true;
-                            self.send_keepalive(true)?;
+                            runtime
+                                .keepalive(self, true)
+                                .map_err(|error| error.map_operation(Into::into))?;
                         }
                     }
                 }
-                () = &mut inactivity_timer => {
+                Event::Inactivity(tick) => {
+                    tick.map_err(RunError::Runtime)?;
                     debug!("timeout");
                     return Err(crate::Error::InactivityTimeout.into());
                 }
-                msg = self.receiver.recv(), if can_receive_outbound => {
+                Event::Outbound(msg) => {
                     match msg {
                         Some(msg) => self.handle_msg(msg)?,
                         None => {
                             self.common.disconnected = true;
-                            break
+                            break;
                         }
                     };
 
-                    // eagerly take all outgoing messages so writes are batched
-                    while !self.kex.active() && !self.common.has_any_pending_data() {
+                    // 只批处理当前队列快照，持续写入不能阻止 read 和 timer 轮转。
+                    let mut remaining = self.receiver.len();
+                    while remaining != 0
+                        && !self.kex.active()
+                        && !self.common.has_any_pending_data()
+                    {
+                        remaining -= 1;
+                        futures::future::poll_fn(|cx| runtime.poll_budget(cx, 1)).await;
                         match self.receiver.try_recv() {
                             Ok(next) => self.handle_msg(next)?,
-                            Err(_) => break
+                            Err(_) => break,
                         }
                     }
                 }
-                msg = self.inbound_channel_receiver.recv(), if can_receive_outbound => {
+                Event::Inbound(msg) => {
                     match msg {
                         Some(msg) => self.handle_msg(msg)?,
                         None => (),
                     }
 
-                    // eagerly take all outgoing messages so writes are batched
-                    while !self.kex.active() && !self.common.has_any_pending_data() {
+                    // 入站 channel 控制消息也受本轮快照和 poll 预算约束。
+                    let mut remaining = self.inbound_channel_receiver.len();
+                    while remaining != 0
+                        && !self.kex.active()
+                        && !self.common.has_any_pending_data()
+                    {
+                        remaining -= 1;
+                        futures::future::poll_fn(|cx| runtime.poll_budget(cx, 1)).await;
                         match self.inbound_channel_receiver.try_recv() {
                             Ok(next) => self.handle_msg(next)?,
-                            Err(_) => break
+                            Err(_) => break,
                         }
                     }
                 }
+                Event::Scoped(Some(command)) => {
+                    runtime
+                        .command(self, command)
+                        .map_err(|error| error.map_operation(Into::into))?;
+                }
+                Event::Scoped(None) => {
+                    self.common.disconnected = true;
+                }
+                Event::Control => {
+                    if runtime
+                        .control(self, stream_write)
+                        .await
+                        .map_err(|error| error.map_operation(Into::into))?
+                    {
+                        return Err(RunError::Disconnected);
+                    }
+                }
+                Event::Write(result) => {
+                    result.map_err(Error::from)?;
+                }
             };
 
+            runtime.observe_server_sig_algs(self.server_sig_algs.as_deref());
+
             self.flush()?;
-            map_err!(self.common.packet_writer.flush_into(stream_write).await)?;
+            if self.scoped_write.is_none() {
+                if !runtime.scoped_io() {
+                    map_err!(self.common.packet_writer.flush_into(stream_write).await)?;
+                }
+                if self.common.packet_writer.buffer().buffer.is_empty() {
+                    runtime
+                        .flush(self, stream_write)
+                        .await
+                        .map_err(|error| error.map_operation(Into::into))?;
+                }
+            }
 
             if let Some(ref mut enc) = self.common.encrypted {
                 if let EncryptedState::InitCompression = enc.state {
@@ -1301,20 +1578,16 @@ impl Session {
                 self.common.alive_timeouts = 0;
             }
             if self.common.received_data || sent_keepalive {
-                if let (futures::future::Either::Right(ref mut sleep), Some(d)) = (
-                    keepalive_timer.as_mut().as_pin_mut(),
-                    self.common.config.keepalive_interval,
-                ) {
-                    sleep.as_mut().reset(tokio::time::Instant::now() + d);
-                }
+                keepalive_timer
+                    .as_mut()
+                    .reset(runtime, self.common.config.keepalive_interval)
+                    .map_err(RunError::Runtime)?;
             }
             if !sent_keepalive {
-                if let (futures::future::Either::Right(ref mut sleep), Some(d)) = (
-                    inactivity_timer.as_mut().as_pin_mut(),
-                    self.common.config.inactivity_timeout,
-                ) {
-                    sleep.as_mut().reset(tokio::time::Instant::now() + d);
-                }
+                inactivity_timer
+                    .as_mut()
+                    .reset(runtime, self.common.config.inactivity_timeout)
+                    .map_err(RunError::Runtime)?;
             }
         }
 

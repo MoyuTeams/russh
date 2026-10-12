@@ -40,13 +40,11 @@ impl Session {
         client: &mut H,
         pkt: &mut IncomingSshPacket,
     ) -> Result<(), H::Error> {
-        #[allow(clippy::indexing_slicing)] // length checked
-        {
-            trace!(
-                "client_read_encrypted, buf = {:?}",
-                &pkt.buffer[..pkt.buffer.len().min(20)]
-            );
-        }
+        trace!(
+            "client_read_encrypted, message = {:?}, len = {}",
+            pkt.buffer.first(),
+            pkt.buffer.len()
+        );
 
         self.process_packet(client, &pkt.buffer).await
     }
@@ -75,11 +73,8 @@ impl Session {
                                 map_err!(ensure_end(&r))?;
                                 *accepted = true;
                                 if let Some(ref meth) = self.common.auth_method {
-                                    let len = enc.write.len();
                                     let auth_request = AuthRequest::new(meth);
-                                    #[allow(clippy::indexing_slicing)] // length checked
                                     if enc.write_auth_request(&self.common.auth_user, meth)? {
-                                        debug!("enc: {:?}", &enc.write[len..]);
                                         enc.state = EncryptedState::WaitingAuthRequest(auth_request)
                                     }
                                 } else {
@@ -104,6 +99,7 @@ impl Session {
                             debug!("userauth_success");
                             self.sender
                                 .send(Reply::AuthSuccess)
+                                .await
                                 .map_err(|_| crate::Error::SendError)?;
                             enc.state = EncryptedState::InitCompression;
                             if enc.server_compression.is_deferred() {
@@ -137,6 +133,7 @@ impl Session {
                                     proceed_with_methods: remaining_methods,
                                     partial_success,
                                 })
+                                .await
                                 .map_err(|_| crate::Error::SendError)?;
 
                             // If no other authentication method is allowed by the server, give up.
@@ -195,6 +192,7 @@ impl Session {
                                         instructions,
                                         prompts,
                                     })
+                                    .await
                                     .map_err(|_| crate::Error::SendError)?;
 
                                 // wait for response from handler
@@ -246,6 +244,7 @@ impl Session {
 
                                     self.sender
                                         .send(Reply::SignRequest { key, data: buf })
+                                        .await
                                         .map_err(|_| crate::Error::SendError)?;
                                     self.common.buffer = loop {
                                         match self.receiver.recv().await {
@@ -279,6 +278,7 @@ impl Session {
                                             hash_alg,
                                             data: buf,
                                         })
+                                        .await
                                         .map_err(|_| crate::Error::SendError)?;
                                     self.common.buffer = loop {
                                         match self.receiver.recv().await {
@@ -444,7 +444,7 @@ impl Session {
                     let _ = sender.send(ChannelMsg::OpenFailure(reason_code.clone())).await;
                 }
 
-                let _ = self.sender.send(Reply::ChannelOpenFailure);
+                let _ = self.sender.send(Reply::ChannelOpenFailure).await;
 
                 client
                     .channel_open_failure(channel_num, reason_code, &descr, &language, self)
@@ -699,7 +699,10 @@ impl Session {
 
                 let (channel, channel_ref) = Channel::new(
                     id,
-                    self.inbound_channel_sender.clone(),
+                    self.inbound_channel_sender
+                        .as_ref()
+                        .ok_or(Error::Inconsistent)?
+                        .clone(),
                     channel_params.recipient_maximum_packet_size,
                     channel_params.recipient_window_size,
                     self.common.config.channel_buffer_size,
@@ -714,7 +717,10 @@ impl Session {
                     channel_params,
                 };
                 let reply = ChannelOpenHandle::new(
-                    self.inbound_channel_sender.clone(),
+                    self.inbound_channel_sender
+                        .as_ref()
+                        .ok_or(Error::Inconsistent)?
+                        .clone(),
                     pending,
                     |pending, result| Msg::ServerChannelOpenReply { pending, result },
                 );

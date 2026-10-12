@@ -13,7 +13,7 @@ const SSH_ID_MAX_PRE_BANNER_LINES: usize = 20;
 /// The buffer to read the identification string (first line in the
 /// protocol).  Not sensitive data — just protocol version exchange.
 struct ReadSshIdBuffer {
-    pub buf: Box<[u8; SSH_ID_BUF_SIZE]>,
+    pub buf: [u8; SSH_ID_BUF_SIZE],
     pub total: usize,
     pub bytes_read: usize,
     pub sshid_len: usize,
@@ -28,7 +28,7 @@ impl ReadSshIdBuffer {
 
     pub fn new() -> ReadSshIdBuffer {
         ReadSshIdBuffer {
-            buf: Box::new([0; SSH_ID_BUF_SIZE]),
+            buf: [0; SSH_ID_BUF_SIZE],
             sshid_len: 0,
             bytes_read: 0,
             total: 0,

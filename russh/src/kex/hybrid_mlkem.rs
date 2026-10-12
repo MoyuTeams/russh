@@ -191,12 +191,9 @@ impl KexAlgorithmImplementor for MlKem768X25519Kex {
         let k_pq = self.k_pq.as_ref().ok_or(Error::KexInit)?;
         let k_cl = self.k_cl.as_ref().ok_or(Error::KexInit)?;
 
-        let mut combined = Vec::new();
-        combined.extend_from_slice(k_pq);
-        combined.extend_from_slice(&k_cl.0);
-
         let mut hasher = sha2::Sha256::new();
-        hasher.update(&combined);
+        hasher.update(k_pq);
+        hasher.update(k_cl.0.as_slice());
         let k = hasher.finalize();
 
         (*k).encode(buffer)?;
@@ -219,12 +216,9 @@ impl KexAlgorithmImplementor for MlKem768X25519Kex {
         let k_pq = self.k_pq.as_ref().ok_or(Error::KexInit)?;
         let k_cl = self.k_cl.as_ref().ok_or(Error::KexInit)?;
 
-        let mut combined = Vec::new();
-        combined.extend_from_slice(k_pq);
-        combined.extend_from_slice(&k_cl.0);
-
         let mut hasher = sha2::Sha256::new();
-        hasher.update(&combined);
+        hasher.update(k_pq);
+        hasher.update(k_cl.0.as_slice());
         let k = hasher.finalize();
 
         let shared_secret = SharedSecret::from_string(&k)?;

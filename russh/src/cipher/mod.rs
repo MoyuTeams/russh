@@ -15,12 +15,10 @@
 //!
 //! This module exports cipher names for use with [Preferred].
 use std::borrow::Borrow;
-use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::num::Wrapping;
-use std::sync::LazyLock;
 
 use aes::{Aes128, Aes192, Aes256};
 #[cfg(feature = "aws-lc-rs")]
@@ -130,25 +128,32 @@ pub static ALL_CIPHERS: &[&Name] = &[
     &CHACHA20_POLY1305,
 ];
 
-pub(crate) static CIPHERS: LazyLock<HashMap<&'static Name, &(dyn Cipher + Send + Sync)>> =
-    LazyLock::new(|| {
-        let mut h: HashMap<&'static Name, &(dyn Cipher + Send + Sync)> = HashMap::new();
-        h.insert(&CLEAR, &_CLEAR);
-        h.insert(&NONE, &_CLEAR);
-        #[cfg(feature = "des")]
-        h.insert(&TRIPLE_DES_CBC, &_3DES_CBC);
-        h.insert(&AES_128_CTR, &_AES_128_CTR);
-        h.insert(&AES_192_CTR, &_AES_192_CTR);
-        h.insert(&AES_256_CTR, &_AES_256_CTR);
-        h.insert(&AES_128_GCM, &_AES_128_GCM);
-        h.insert(&AES_256_GCM, &_AES_256_GCM);
-        h.insert(&AES_128_CBC, &_AES_128_CBC);
-        h.insert(&AES_192_CBC, &_AES_192_CBC);
-        h.insert(&AES_256_CBC, &_AES_256_CBC);
-        h.insert(&CHACHA20_POLY1305, &_CHACHA20_POLY1305);
-        assert_eq!(h.len(), ALL_CIPHERS.len());
-        h
-    });
+pub(crate) struct CipherRegistry(&'static [(&'static Name, &'static (dyn Cipher + Send + Sync))]);
+
+impl CipherRegistry {
+    pub(crate) fn get(&self, name: &Name) -> Option<&'static &'static (dyn Cipher + Send + Sync)> {
+        self.0
+            .iter()
+            .find_map(|(key, value)| (*key == name).then_some(value))
+    }
+}
+
+// 固定算法表在只读静态存储中，不初始化随机 HashMap 或线程局部随机状态。
+pub(crate) static CIPHERS: CipherRegistry = CipherRegistry(&[
+    (&CLEAR, &_CLEAR),
+    (&NONE, &_CLEAR),
+    #[cfg(feature = "des")]
+    (&TRIPLE_DES_CBC, &_3DES_CBC),
+    (&AES_128_CTR, &_AES_128_CTR),
+    (&AES_192_CTR, &_AES_192_CTR),
+    (&AES_256_CTR, &_AES_256_CTR),
+    (&AES_128_GCM, &_AES_128_GCM),
+    (&AES_256_GCM, &_AES_256_GCM),
+    (&AES_128_CBC, &_AES_128_CBC),
+    (&AES_192_CBC, &_AES_192_CBC),
+    (&AES_256_CBC, &_AES_256_CBC),
+    (&CHACHA20_POLY1305, &_CHACHA20_POLY1305),
+]);
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
 pub struct Name(&'static str);
@@ -174,7 +179,12 @@ impl Borrow<str> for &Name {
 impl TryFrom<&str> for Name {
     type Error = ();
     fn try_from(s: &str) -> Result<Name, ()> {
-        CIPHERS.keys().find(|x| x.0 == s).map(|x| **x).ok_or(())
+        CIPHERS
+            .0
+            .iter()
+            .find(|(key, _)| key.0 == s)
+            .map(|(key, _)| **key)
+            .ok_or(())
     }
 }
 
@@ -347,6 +357,75 @@ pub(crate) async fn read<R: AsyncRead + Unpin>(
     buffer.buffer.resize(plaintext_end + 4, 0);
 
     Ok(plaintext_end + 4)
+}
+
+pub(crate) async fn read_scoped<R, S>(
+    scope: &S,
+    stream: &mut R,
+    buffer: &mut SSHBuffer,
+    cipher: &mut (dyn OpeningKey + Send),
+) -> Result<usize, crate::scoped::ScopedError<Error>>
+where
+    R: AsyncRead + Unpin,
+    S: crate::scoped::AdmissionScope,
+{
+    use crate::scoped::{ResourceClass, ScopedBuffer, ScopedError, ScopedFault};
+    let site = "client.packet.read";
+    let prefix_len = cipher.packet_length_to_read_for_block_length();
+    let mut prefix = [0u8; 16];
+    let prefix = prefix
+        .get_mut(..prefix_len)
+        .ok_or(ScopedError::Operation(Error::Inconsistent))?;
+    stream
+        .read_exact(prefix)
+        .await
+        .map_err(|error| ScopedError::Operation(error.into()))?;
+    let packet_len =
+        u32::from_be_bytes(cipher.decrypt_packet_length(buffer.seqn.0, prefix)) as usize;
+    if packet_len > MAXIMUM_PACKET_LEN {
+        return Err(ScopedError::Operation(Error::PacketSize(packet_len)));
+    }
+    let total = packet_len
+        .checked_add(4)
+        .and_then(|n| n.checked_add(cipher.tag_len()))
+        .ok_or_else(|| ScopedError::Resource(ScopedFault::overflow(site)))?;
+    if total < prefix_len {
+        return Err(ScopedError::Operation(Error::Inconsistent));
+    }
+    let mut data = match buffer.scoped.take() {
+        Some(data) => data
+            .into_typed::<S::Reservation>()
+            .map_err(ScopedError::Resource)?,
+        None => ScopedBuffer::try_with_capacity(scope, ResourceClass::Secret, site, total)
+            .map_err(ScopedError::Resource)?,
+    };
+    data.clear();
+    data.try_resize(scope, total, 0)
+        .map_err(ScopedError::Resource)?;
+    let (head, tail) = data.as_mut_slice().split_at_mut(prefix_len);
+    head.copy_from_slice(prefix);
+    stream
+        .read_exact(tail)
+        .await
+        .map_err(|error| ScopedError::Operation(error.into()))?;
+    let plaintext = cipher
+        .open(buffer.seqn.0, data.as_mut_slice())
+        .map_err(ScopedError::Operation)?;
+    let padding = usize::from(
+        *plaintext
+            .first()
+            .ok_or(ScopedError::Operation(Error::Inconsistent))?,
+    );
+    let end = plaintext
+        .len()
+        .checked_sub(padding)
+        .and_then(|n| n.checked_add(4))
+        .ok_or(ScopedError::Operation(Error::IndexOutOfBounds))?;
+    data.truncate(end);
+    buffer.scoped = Some(data.erase());
+    buffer.seqn += Wrapping(1);
+    buffer.len = 0;
+    Ok(end)
 }
 
 pub(crate) const PACKET_LENGTH_LEN: usize = 4;

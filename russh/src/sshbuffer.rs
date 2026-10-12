@@ -289,6 +289,7 @@ fn packet_bytes_compressed_matches_packet_output() {
 #[derive(Debug, Default)]
 pub struct SSHBuffer {
     pub buffer: Vec<u8>,
+    pub(crate) scoped: Option<crate::scoped::ErasedBuffer>,
     pub len: usize,   // next packet length.
     pub bytes: usize, // total bytes written since the last rekey
     // Sequence numbers are on 32 bits and wrap.
@@ -300,6 +301,7 @@ impl SSHBuffer {
     pub fn new() -> Self {
         SSHBuffer {
             buffer: Vec::new(),
+            scoped: None,
             len: 0,
             bytes: 0,
             seqn: Wrapping(0),
@@ -308,6 +310,12 @@ impl SSHBuffer {
 
     pub fn send_ssh_id(&mut self, id: &SshId) {
         id.write(&mut self.buffer);
+    }
+
+    pub(crate) fn packet_bytes(&self) -> &[u8] {
+        self.scoped
+            .as_ref()
+            .map_or(self.buffer.as_slice(), |buffer| buffer.as_slice())
     }
 }
 
@@ -371,6 +379,118 @@ impl Debug for PacketWriter {
 }
 
 impl PacketWriter {
+    pub(crate) fn poll_flush_into<W: AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut W,
+        offset: &mut usize,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::pin::Pin;
+        use std::task::Poll;
+
+        if self.write_buffer.buffer.is_empty() {
+            return Poll::Pending;
+        }
+        let remaining = self.write_buffer.buffer.split_at(*offset).1;
+        if !remaining.is_empty() {
+            return match Pin::new(&mut *stream).poll_write(cx, remaining) {
+                Poll::Ready(Ok(0)) => Poll::Ready(Err(std::io::ErrorKind::WriteZero.into())),
+                Poll::Ready(Ok(count)) => {
+                    *offset += count;
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+                Poll::Pending => Poll::Pending,
+            };
+        }
+        match Pin::new(stream).poll_flush(cx) {
+            Poll::Ready(Ok(())) => {
+                self.write_buffer.buffer.clear();
+                *offset = 0;
+                Poll::Ready(Ok(()))
+            }
+            result => result,
+        }
+    }
+
+    pub(crate) fn scoped_packet<S: crate::scoped::AdmissionScope>(
+        &mut self,
+        scope: &S,
+        payload: &[u8],
+    ) -> Result<crate::scoped::ScopedBuffer<S::Reservation>, crate::scoped::ScopedFault> {
+        use crate::scoped::{ResourceClass, ScopedBuffer};
+        let total = self.scoped_packet_size(payload)?;
+        let output = ScopedBuffer::try_with_capacity(
+            scope,
+            ResourceClass::Secret,
+            "client.packet.seal",
+            total,
+        )?;
+        self.scoped_packet_into(scope, payload, output)
+    }
+
+    pub(crate) fn scoped_packet_size(
+        &self,
+        payload: &[u8],
+    ) -> Result<usize, crate::scoped::ScopedFault> {
+        use crate::scoped::{FaultKind, ScopedFault};
+        let site = "client.packet.seal";
+        if !matches!(self.compress, Compress::None) {
+            return Err(ScopedFault {
+                kind: FaultKind::PolicyUnavailable,
+                site: "client.packet.compression",
+                requested: payload.len(),
+                available: None,
+            });
+        }
+        let padding = self.cipher.padding_length(payload);
+        let packet_len = 1usize
+            .checked_add(payload.len())
+            .and_then(|n| n.checked_add(padding))
+            .ok_or_else(|| ScopedFault::overflow(site))?;
+        u32::try_from(packet_len).map_err(|_| ScopedFault::overflow(site))?;
+        u8::try_from(padding).map_err(|_| ScopedFault::overflow(site))?;
+        4usize
+            .checked_add(packet_len)
+            .and_then(|n| n.checked_add(self.cipher.tag_len()))
+            .ok_or_else(|| ScopedFault::overflow(site))
+    }
+
+    pub(crate) fn scoped_packet_into<S: crate::scoped::AdmissionScope>(
+        &mut self,
+        scope: &S,
+        payload: &[u8],
+        mut output: crate::scoped::ScopedBuffer<S::Reservation>,
+    ) -> Result<crate::scoped::ScopedBuffer<S::Reservation>, crate::scoped::ScopedFault> {
+        use crate::scoped::ScopedFault;
+        let site = "client.packet.seal";
+        let total = self.scoped_packet_size(payload)?;
+        let padding = self.cipher.padding_length(payload);
+        let packet_len = total - 4 - self.cipher.tag_len();
+        let wire_len = u32::try_from(packet_len).map_err(|_| ScopedFault::overflow(site))?;
+        let padding_byte = u8::try_from(padding).map_err(|_| ScopedFault::overflow(site))?;
+        let bytes_written = self
+            .write_buffer
+            .bytes
+            .checked_add(payload.len())
+            .ok_or_else(|| ScopedFault::overflow(site))?;
+        output.clear();
+        output.try_reserve(scope, total)?;
+        output.try_extend_from_slice(scope, &wire_len.to_be_bytes())?;
+        output.try_extend_from_slice(scope, &[padding_byte])?;
+        output.try_extend_from_slice(scope, payload)?;
+        output.try_resize(scope, total, 0)?;
+        let body_end = 4 + packet_len;
+        let payload_end = 5 + payload.len();
+        let (body, tag) = output.as_mut_slice().split_at_mut(body_end);
+        let (_, padding_out) = body.split_at_mut(payload_end);
+        self.cipher.fill_padding(padding_out);
+        self.cipher.seal(self.write_buffer.seqn.0, body, tag);
+        self.write_buffer.seqn += Wrapping(1);
+        self.write_buffer.bytes = bytes_written;
+        Ok(output)
+    }
+
     // SSH packet prefix = packet_length (cipher::PACKET_LENGTH_LEN bytes)
     // + padding_length (1 byte).
     const PACKET_PREFIX_LEN: usize = cipher::PACKET_LENGTH_LEN + 1;

@@ -21,10 +21,8 @@ mod ecdh_nistp;
 mod hybrid_mlkem;
 mod none;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::Debug;
-use std::sync::LazyLock;
 
 use curve25519::Curve25519KexType;
 use delegate::delegate;
@@ -224,7 +222,12 @@ impl Encode for Name {
 impl TryFrom<&str> for Name {
     type Error = ();
     fn try_from(s: &str) -> Result<Name, ()> {
-        KEXES.keys().find(|x| x.0 == s).map(|x| **x).ok_or(())
+        KEXES
+            .0
+            .iter()
+            .find(|(key, _)| key.0 == s)
+            .map(|(key, _)| **key)
+            .ok_or(())
     }
 }
 
@@ -304,28 +307,34 @@ pub const ALL_KEX_ALGORITHMS: &[&Name] = &[
     &NONE,
 ];
 
-pub(crate) static KEXES: LazyLock<HashMap<&'static Name, &(dyn KexType + Send + Sync)>> =
-    LazyLock::new(|| {
-        let mut h: HashMap<&'static Name, &(dyn KexType + Send + Sync)> = HashMap::new();
-        h.insert(&MLKEM768X25519_SHA256, &_MLKEM768X25519_SHA256);
-        h.insert(&CURVE25519, &_CURVE25519);
-        h.insert(&CURVE25519_PRE_RFC_8731, &_CURVE25519);
-        h.insert(&DH_GEX_SHA1, &_DH_GEX_SHA1);
-        h.insert(&DH_GEX_SHA256, &_DH_GEX_SHA256);
-        h.insert(&DH_G18_SHA512, &_DH_G18_SHA512);
-        h.insert(&DH_G17_SHA512, &_DH_G17_SHA512);
-        h.insert(&DH_G16_SHA512, &_DH_G16_SHA512);
-        h.insert(&DH_G15_SHA512, &_DH_G15_SHA512);
-        h.insert(&DH_G14_SHA256, &_DH_G14_SHA256);
-        h.insert(&DH_G14_SHA1, &_DH_G14_SHA1);
-        h.insert(&DH_G1_SHA1, &_DH_G1_SHA1);
-        h.insert(&ECDH_SHA2_NISTP256, &_ECDH_SHA2_NISTP256);
-        h.insert(&ECDH_SHA2_NISTP384, &_ECDH_SHA2_NISTP384);
-        h.insert(&ECDH_SHA2_NISTP521, &_ECDH_SHA2_NISTP521);
-        h.insert(&NONE, &_NONE);
-        assert_eq!(ALL_KEX_ALGORITHMS.len(), h.len());
-        h
-    });
+pub(crate) struct KexRegistry(&'static [(&'static Name, &'static (dyn KexType + Send + Sync))]);
+
+impl KexRegistry {
+    pub(crate) fn get(&self, name: &Name) -> Option<&'static &'static (dyn KexType + Send + Sync)> {
+        self.0
+            .iter()
+            .find_map(|(key, value)| (*key == name).then_some(value))
+    }
+}
+
+pub(crate) static KEXES: KexRegistry = KexRegistry(&[
+    (&MLKEM768X25519_SHA256, &_MLKEM768X25519_SHA256),
+    (&CURVE25519, &_CURVE25519),
+    (&CURVE25519_PRE_RFC_8731, &_CURVE25519),
+    (&DH_GEX_SHA1, &_DH_GEX_SHA1),
+    (&DH_GEX_SHA256, &_DH_GEX_SHA256),
+    (&DH_G18_SHA512, &_DH_G18_SHA512),
+    (&DH_G17_SHA512, &_DH_G17_SHA512),
+    (&DH_G16_SHA512, &_DH_G16_SHA512),
+    (&DH_G15_SHA512, &_DH_G15_SHA512),
+    (&DH_G14_SHA256, &_DH_G14_SHA256),
+    (&DH_G14_SHA1, &_DH_G14_SHA1),
+    (&DH_G1_SHA1, &_DH_G1_SHA1),
+    (&ECDH_SHA2_NISTP256, &_ECDH_SHA2_NISTP256),
+    (&ECDH_SHA2_NISTP384, &_ECDH_SHA2_NISTP384),
+    (&ECDH_SHA2_NISTP521, &_ECDH_SHA2_NISTP521),
+    (&NONE, &_NONE),
+]);
 
 thread_local! {
     static KEY_BUF: RefCell<CryptoVec> = RefCell::new(CryptoVec::new());

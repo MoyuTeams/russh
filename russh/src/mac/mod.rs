@@ -13,10 +13,8 @@
 
 //!
 //! This module exports cipher names for use with [Preferred].
-use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::marker::PhantomData;
-use std::sync::LazyLock;
 
 use delegate::delegate;
 use digest::typenum::{U20, U32, U64};
@@ -65,7 +63,11 @@ impl Encode for Name {
 impl TryFrom<&str> for Name {
     type Error = ();
     fn try_from(s: &str) -> Result<Name, ()> {
-        MACS.keys().find(|x| x.0 == s).map(|x| **x).ok_or(())
+        MACS.0
+            .iter()
+            .find(|(key, _)| key.0 == s)
+            .map(|(key, _)| **key)
+            .ok_or(())
     }
 }
 
@@ -108,16 +110,27 @@ pub const ALL_MAC_ALGORITHMS: &[&Name] = &[
     &HMAC_SHA512_ETM,
 ];
 
-pub(crate) static MACS: LazyLock<HashMap<&'static Name, &(dyn MacAlgorithm + Send + Sync)>> =
-    LazyLock::new(|| {
-        let mut h: HashMap<&'static Name, &(dyn MacAlgorithm + Send + Sync)> = HashMap::new();
-        h.insert(&NONE, &_NONE);
-        h.insert(&HMAC_SHA1, &_HMAC_SHA1);
-        h.insert(&HMAC_SHA256, &_HMAC_SHA256);
-        h.insert(&HMAC_SHA512, &_HMAC_SHA512);
-        h.insert(&HMAC_SHA1_ETM, &_HMAC_SHA1_ETM);
-        h.insert(&HMAC_SHA256_ETM, &_HMAC_SHA256_ETM);
-        h.insert(&HMAC_SHA512_ETM, &_HMAC_SHA512_ETM);
-        assert_eq!(h.len(), ALL_MAC_ALGORITHMS.len());
-        h
-    });
+pub(crate) struct MacRegistry(
+    &'static [(&'static Name, &'static (dyn MacAlgorithm + Send + Sync))],
+);
+
+impl MacRegistry {
+    pub(crate) fn get(
+        &self,
+        name: &Name,
+    ) -> Option<&'static &'static (dyn MacAlgorithm + Send + Sync)> {
+        self.0
+            .iter()
+            .find_map(|(key, value)| (*key == name).then_some(value))
+    }
+}
+
+pub(crate) static MACS: MacRegistry = MacRegistry(&[
+    (&NONE, &_NONE),
+    (&HMAC_SHA1, &_HMAC_SHA1),
+    (&HMAC_SHA256, &_HMAC_SHA256),
+    (&HMAC_SHA512, &_HMAC_SHA512),
+    (&HMAC_SHA1_ETM, &_HMAC_SHA1_ETM),
+    (&HMAC_SHA256_ETM, &_HMAC_SHA256_ETM),
+    (&HMAC_SHA512_ETM, &_HMAC_SHA512_ETM),
+]);
