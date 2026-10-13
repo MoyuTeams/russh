@@ -321,8 +321,8 @@ impl Decompress {
                     let d = z.decompress(&input[n_in_..], &mut output[n_out_..], flush);
                     match d? {
                         flate2::Status::Ok | flate2::Status::BufError => {
-                            let consumed_all_input = n_in_ == input.len();
-                            let output_full = n_out_ == output.len();
+                            let consumed_all_input = z.total_in() as usize - n_in == input.len();
+                            let output_full = z.total_out() as usize - n_out == output.len();
 
                             if !output_full && consumed_all_input {
                                 break;
